@@ -46,22 +46,22 @@ $Config = @{
     NsxUser         = "admin"
 
     # --- vCenter (Compute Manager) ---
-    vCenterServer   = "vcsa01.kodevirtual.com"
+    vCenterServer   = "non-fed-vcsa01.arkvcfimp.kodevirtual.com"
     vCenterUser     = "administrator@vsphere.local"
-    ComputeMgrName  = "vcsa01"
+    ComputeMgrName  = "non-fed-vcsa01.arkvcfimp.kodevirtual.com"
 
     # --- Host preparation ---
-    Cluster         = "Lab-Cluster-02"          # Cluster to prepare with the TNP
+    Cluster         = "non-fed-cl01"            # Cluster to prepare with the TNP
     VDSwitch        = "vDS-01-Mgmt"             # VDS used for NSX (must be VDS 7.0+)
     VdsMtu          = 9000                      # Raised only if current MTU < 1700
 
     # --- 1. IP pools ---
-    HostTepPool = @{ Id = "host-tep-pool"; Cidr = "172.21.5.0/24"; Gateway = "172.21.5.1"; Start = "172.21.5.11"; End = "172.21.5.50" }
-    EdgeTepPool = @{ Id = "edge-tep-pool"; Cidr = "172.21.6.0/24"; Gateway = "172.21.6.1"; Start = "172.21.6.11"; End = "172.21.6.30" }
+    HostTepPool = @{ Id = "host-tep-pool"; Cidr = "172.21.13.0/24"; Gateway = "172.21.13.1"; Start = "172.21.13.110"; End = "172.21.13.120" }
+    EdgeTepPool = @{ Id = "edge-tep-pool"; Cidr = "172.21.14.0/24"; Gateway = "172.21.14.1"; Start = "172.21.14.110"; End = "172.21.14.120" }
 
     # --- 3. Uplink profiles ---
-    HostTepVlan       = 2105
-    EdgeTepVlan       = 2106
+    HostTepVlan       = 2103
+    EdgeTepVlan       = 2104
     HostUplinkProfile = "host-uplink-profile"
     EdgeUplinkProfile = "edge-uplink-profile"
     EdgeNamedTeaming  = "uplink-1-only"         # Pins BGP uplink VLAN to fp-eth0
@@ -71,7 +71,7 @@ $Config = @{
     VlanTZ          = "tz-vlan-edge"
 
     # --- 5/6. Transport Node Profile ---
-    TNP             = "tnp-lab-cluster-02"
+    TNP             = "tnp-non-fed-cl01"
 
     # --- 7. Edge node ---
     Edge = @{
@@ -94,22 +94,22 @@ $Config = @{
     EdgeCluster     = "edge-cluster-01"
 
     # --- 8. BGP uplink VLAN segment ---
-    UplinkSegment   = @{ Id = "seg-t0-uplink-2107"; VlanId = 2107 }
+    UplinkSegment   = @{ Id = "seg-t0-uplink-2105"; VlanId = 2105 }
 
     # --- 9. Tier-0 ---
     T0 = @{
         Id           = "t0-gw01"
         HaMode       = "ACTIVE_STANDBY"
-        UplinkIP     = "172.21.7.2"
+        UplinkIP     = "172.21.15.20"
         UplinkPrefix = 24
         UplinkMtu    = 1500
     }
 
     # --- 10. BGP ---
     Bgp = @{
-        LocalAS    = "65001"
-        NeighborIP = "172.21.7.1"
-        RemoteAS   = "65000"
+        LocalAS    = "65511"
+        NeighborIP = "172.21.15.1"
+        RemoteAS   = "65500"
         Password   = ""             # Optional MD5 password
         KeepAlive  = 4
         HoldDown   = 12
@@ -120,9 +120,9 @@ $Config = @{
 
     # --- 12. Segments ---
     Segments = @(
-        @{ Id = "seg-web"; Gateway = "10.10.10.1/24" }
-        @{ Id = "seg-app"; Gateway = "10.10.20.1/24" }
-        @{ Id = "seg-db";  Gateway = "10.10.30.1/24" }
+        @{ Id = "non-fed01-seg-web"; Gateway = "10.25.110.1/24" }
+        @{ Id = "non-fed01-seg-app"; Gateway = "10.25.111.1/24" }
+        @{ Id = "non-fed01-seg-db";  Gateway = "10.25.112.1/24" }
     )
 }
 
@@ -320,8 +320,23 @@ try {
         )
         $trunkPgs = @()
         foreach ($t in $trunkDefs) {
-            $pg = Get-VDPortgroup -VDSwitch $vds -Name $t.Name -ErrorAction SilentlyContinue
-            if ($pg) { Write-Skip "Trunk port group $($t.Name)" }
+            # Port group names are unique per datacenter, so search every VDS (not just this one)
+            $pg = Get-VDPortgroup -Name $t.Name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $pg) {
+                $view = Get-View -ViewType DistributedVirtualPortgroup -Filter @{ Name = "^$([regex]::Escape($t.Name))$" } -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($view) { $pg = Get-VIObjectByVIView -VIView $view }
+            }
+            if ($pg) {
+                $pgVds = $pg.VDSwitch.Name
+                Write-Skip "Trunk port group $($t.Name) (on $pgVds)"
+                if ($pgVds -and $pgVds -ne $vds.Name) {
+                    Write-Warn2 "$($t.Name) is on $pgVds, not $($vds.Name) - it will be used for the Edge. Hosts in $($Config.Cluster) must be members of $pgVds."
+                }
+                $vlanCfg = $pg.ExtensionData.Config.DefaultPortConfig.Vlan
+                if ($vlanCfg -and $vlanCfg.GetType().Name -ne "VmwareDistributedVirtualSwitchTrunkVlanSpec") {
+                    Write-Warn2 "$($t.Name) is not a VLAN trunk - Edge TEP/uplink VLAN tagging will not work. Set it to trunk 0-4094."
+                }
+            }
             else {
                 $pg = New-VDPortgroup -VDSwitch $vds -Name $t.Name -VlanTrunkRange "0-4094" -NumPorts 8
                 $pg | Get-VDUplinkTeamingPolicy |
