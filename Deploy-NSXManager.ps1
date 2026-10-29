@@ -31,33 +31,33 @@ param(
 
 $Config = @{
     # --- vCenter ---
-    vCenterServer     = "vcenter01.lab.local"
+    vCenterServer     = "vcsa01.kodevirtual.com"
     vCenterUser       = "administrator@vsphere.local"
 
     # --- OVA ---
-    OvaPath           = "C:\ISO\nsx-unified-appliance-4.2.1.0.0.24304122.ova"
+    OvaPath           = "C:\Users\Administrator\Downloads\nsx-unified-appliance-4.2.4.1.0.25554968.ova"
 
     # --- Placement ---
-    Cluster           = "Mgmt-Cluster"         # Set either Cluster or VMHost
+    Cluster           = "Lab-Cluster"          # Set either Cluster or VMHost
     VMHost            = ""                     # Optional: specific ESXi host
     Datastore         = "vsanDatastore"
-    PortGroup         = "Mgmt-VDS-PG"          # VSS or VDS port group name
+    PortGroup         = "Nested-SA-Mgmt-2100"  # VSS or VDS port group name
     VMFolder          = ""                     # Optional: VM folder name
     DiskFormat        = "Thin"                 # Thin | Thick | EagerZeroedThick
 
     # --- Appliance ---
-    VMName            = "nsx-mgr-01"
-    Hostname          = "nsx-mgr-01"           # Short hostname (FQDN = Hostname.Domain)
+    VMName            = "nonfed-nsx01"
+    Hostname          = "nonfed-nsx01"         # Short hostname (FQDN = Hostname.Domain)
     Role              = "NSX Manager"          # "NSX Manager" | "NSX Global Manager"
     DeploymentSize    = "medium"               # extra_small | small | medium | large
 
     # --- Networking ---
-    IPAddress         = "192.168.10.50"
+    IPAddress         = "172.21.10.81"
     Netmask           = "255.255.255.0"
-    Gateway           = "192.168.10.1"
-    DNSServers        = "192.168.10.10,192.168.10.11"   # Comma separated
-    DomainSearch      = "lab.local"
-    NTPServers        = "192.168.10.10,pool.ntp.org"    # Comma separated
+    Gateway           = "172.21.10.1"
+    DNSServers        = "172.16.101.9"         # Comma separated
+    DomainSearch      = "arkvcfimp.kodevirtual.com"
+    NTPServers        = "172.16.101.6"         # Comma separated
 
     # --- Users ---
     AdminUsername     = "admin"
@@ -65,7 +65,7 @@ $Config = @{
 
     # --- SSH ---
     EnableSSH         = $true
-    AllowRootSSH      = $false
+    AllowRootSSH      = $true
 }
 
 #endregion ===========================================================================
