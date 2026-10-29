@@ -190,8 +190,15 @@ try {
     Write-Ok "Datastore: $($datastore.Name) ($([math]::Round($datastore.FreeSpaceGB)) GB free)"
     if ($datastore.FreeSpaceGB -lt 300) { Write-Warn2 "Less than 300 GB free - thick deployment may fail" }
 
-    $portGroup = Get-VirtualPortGroup -VMHost $vmHost -Name $Config.PortGroup -ErrorAction SilentlyContinue
-    if (-not $portGroup) { $portGroup = Get-VDPortgroup -Name $Config.PortGroup -ErrorAction Stop }
+    # Try distributed port group first, then standard (avoids PowerCLI obsolete-output warning)
+    $portGroup = $null
+    if (Get-Command Get-VDPortgroup -ErrorAction SilentlyContinue) {
+        $portGroup = Get-VDPortgroup -Name $Config.PortGroup -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if (-not $portGroup) {
+        $portGroup = Get-VirtualPortGroup -VMHost $vmHost -Name $Config.PortGroup -Standard -ErrorAction SilentlyContinue
+    }
+    if (-not $portGroup) { throw "Port group '$($Config.PortGroup)' not found on VDS or VSS of $($vmHost.Name)." }
     Write-Ok "Port group: $($portGroup.Name)"
 
     $folder = $null
@@ -205,9 +212,23 @@ try {
     $ovfConfig = Get-OvfConfiguration -Ovf $Config.OvaPath
 
     # Deployment size
-    $allowedSizes = $ovfConfig.DeploymentOption.AllowedValues
-    if ($allowedSizes -notcontains $Config.DeploymentSize) {
-        throw "Invalid DeploymentSize '$($Config.DeploymentSize)'. Allowed: $($allowedSizes -join ', ')"
+    # Allowed values live in OvfTypeDescription, e.g.: string["small", "medium", "large", "extra_small"]
+    $typeDesc     = [string]$ovfConfig.DeploymentOption.OvfTypeDescription
+    $allowedSizes = @([regex]::Matches($typeDesc, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+    if (-not $allowedSizes) {
+        # Fallback for PowerCLI versions that expose AllowedValues
+        $allowedSizes = @($ovfConfig.DeploymentOption.AllowedValues | Where-Object { $_ })
+    }
+
+    if ($allowedSizes) {
+        # Case-insensitive match, then use the OVA's exact key
+        $match = $allowedSizes | Where-Object { $_ -ieq $Config.DeploymentSize } | Select-Object -First 1
+        if (-not $match) {
+            throw "Invalid DeploymentSize '$($Config.DeploymentSize)'. Allowed: $($allowedSizes -join ', ')"
+        }
+        $Config.DeploymentSize = $match
+    } else {
+        Write-Warn2 "Could not read allowed sizes from OVA - using '$($Config.DeploymentSize)' as-is"
     }
     $ovfConfig.DeploymentOption.Value = $Config.DeploymentSize
     Write-Ok "Size: $($Config.DeploymentSize)"
