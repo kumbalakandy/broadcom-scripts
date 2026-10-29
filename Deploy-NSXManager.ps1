@@ -277,6 +277,7 @@ try {
         VMHost            = $vmHost
         Datastore         = $datastore
         DiskStorageFormat = $Config.DiskFormat
+        Force             = $true     # Deploy even if vCenter can't verify the OVA signing cert (e.g. Broadcom-signed OVA on vCenter 7.x)
         Confirm           = $false
     }
     if ($folder) { $importParams.InventoryLocation = $folder }
