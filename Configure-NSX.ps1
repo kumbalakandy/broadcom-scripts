@@ -458,11 +458,11 @@ try {
         }
         $hostProfilePath = $hp.path
 
-        $ep = Find-NsxObject $hspList $Config.EdgeUplinkProfile
-        if ($ep) {
-            Write-Skip "Edge uplink profile $($ep.display_name)"
-            if ($ep.named_teamings.name -notcontains $Config.EdgeNamedTeaming) {
-                throw "Existing profile '$($ep.display_name)' has no named teaming '$($Config.EdgeNamedTeaming)'. Add it or change EdgeNamedTeaming."
+        $edgeProf = Find-NsxObject $hspList $Config.EdgeUplinkProfile
+        if ($edgeProf) {
+            Write-Skip "Edge uplink profile $($edgeProf.display_name)"
+            if ($edgeProf.named_teamings.name -notcontains $Config.EdgeNamedTeaming) {
+                throw "Existing profile '$($edgeProf.display_name)' has no named teaming '$($Config.EdgeNamedTeaming)'. Add it or change EdgeNamedTeaming."
             }
         } else {
             Invoke-Nsx PATCH "$hspList/$($Config.EdgeUplinkProfile)" @{
@@ -481,11 +481,11 @@ try {
                     active_list = @(@{ uplink_name = "uplink-1"; uplink_type = "PNIC" })
                 })
             } | Out-Null
-            $ep = Invoke-Nsx GET "$hspList/$($Config.EdgeUplinkProfile)"
+            $edgeProf = Invoke-Nsx GET "$hspList/$($Config.EdgeUplinkProfile)"
             Write-Ok "Edge uplink profile $($Config.EdgeUplinkProfile) (TEP VLAN $($Config.EdgeTepVlan), teaming $($Config.EdgeNamedTeaming))"
         }
-        $edgeProfilePath = $ep.path
-        $edgeProfileName = $ep.display_name
+        $edgeProfilePath = $edgeProf.path
+        $edgeProfileName = $edgeProf.display_name
     }
 
     #endregion
