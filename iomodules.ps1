@@ -8,6 +8,26 @@
     If the script "will not load" on Windows, it is usually the execution policy or the downloaded-file block:
         Unblock-File .\Get-ClusterIoCompatibility.ps1
         Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.PARAMETER OutputFolder
+    Folder for the results. Default: .\IoCompatibility_<vCenter>_<timestamp>
+    Inside it, one subfolder per cluster holds that cluster's files:
+        <Cluster>\<Cluster>_IO.csv          unique IO devices with BCG status
+        <Cluster>\<Cluster>_IO_PerHost.csv  every IO device on every host
+        <Cluster>\<Cluster>_IO_Hosts.csv    server, boot mode and boot disk details
+    plus Clusters_Summary.csv at the top level with counts per cluster.
+.PARAMETER OutputCsv
+    Kept for compatibility: if given (and -OutputFolder isn't), its folder and file name
+    (without extension) become the output folder, e.g. C:\Temp\io.csv -> C:\Temp\io\
+.PARAMETER PciIdsFile
+    Path to a pci.ids file (PCI ID database) used to name the exact card from VID/DID/SVID/SSID.
+    If omitted, pci.ids next to the script or in the current folder is used, otherwise it is
+    downloaded once (needs internet). For offline use get it from https://pci-ids.ucw.cz/v2.2/pci.ids
+.PARAMETER NoPciIds
+    Don't use the PCI ID database; exact names then come from the BCG SSID match only.
+.NOTES
+    Exact model: VID+DID identify the chip, SVID the card maker and SSID (subsystem device ID) the
+    exact card. ExactModel comes from, in order: the BCG entry matching the SSID, the PCI ID database
+    entry for VID:DID:SVID:SSID, the only BCG entry for VID/DID/SVID, or the chip name (ModelSource says which).
 .EXAMPLE
     .\Get-ClusterIoCompatibility.ps1 -vCenter vc01.lab.local -All
 .EXAMPLE
@@ -21,7 +41,10 @@ param(
     [switch]$All,
     [int]$ShowNumberOfSupportedReleases = 4,
     [string]$OutputCsv,
-    [switch]$SkipVersions
+    [string]$OutputFolder,
+    [switch]$SkipVersions,
+    [string]$PciIdsFile,
+    [switch]$NoPciIds
 )
 
 # Devices to ignore (partial or full match on device name) - from queryHostPCIInfo.ps1
@@ -30,6 +53,180 @@ $excludeDevices = @(
     "<class> ISA bridge", "Series Chipset Family", "Ice Lake RAS", "Ice Lake IEH",
     "MSM", "UPI", "Memory Map/VT-d", "Mesh 2 PCIe"
 )
+
+#region Exact model: PCI ID database + SSID matching
+# VID+DID identify the chip, SVID the card maker, SSID (subsystem device ID) the exact card.
+function Import-PciIds {
+    param([string]$File)
+    $db = @{ Vendors = @{}; Devices = @{}; Subsys = @{} }
+    $vid = $null; $did = $null
+    foreach ($line in [System.IO.File]::ReadLines($File)) {
+        if ($line.Length -lt 2 -or $line[0] -eq '#') { continue }
+        if ($line.StartsWith('C ')) { break }        # device-class section is not needed
+        if ($line.StartsWith("`t`t")) {
+            if ($vid -and $did -and $line -match '^\t\t([0-9a-fA-F]{4}) ([0-9a-fA-F]{4})\s+(.+)$') {
+                $db.Subsys["$vid`:$did`:$($Matches[1].ToLower()):$($Matches[2].ToLower())"] = $Matches[3].Trim()
+            }
+        }
+        elseif ($line[0] -eq "`t") {
+            if ($vid -and $line -match '^\t([0-9a-fA-F]{4})\s+(.+)$') {
+                $did = $Matches[1].ToLower()
+                $db.Devices["$vid`:$did"] = $Matches[2].Trim()
+            }
+        }
+        elseif ($line -match '^([0-9a-fA-F]{4})\s+(.+)$') {
+            $vid = $Matches[1].ToLower(); $did = $null
+            $db.Vendors[$vid] = $Matches[2].Trim()
+        }
+    }
+    return $db
+}
+
+function Get-PciIdsDatabase {
+    # Uses -PciIdsFile, else pci.ids in one of the search folders, else downloads it (needs internet)
+    param([string]$File, [string[]]$SearchFolders, [hashtable]$WebParams)
+    $found = $null
+    if ($File) {
+        if (Test-Path -LiteralPath $File -PathType Leaf) { $found = $File }
+        else { Write-Warning "PCI ID file not found: $File" }
+    }
+    if (-not $found) {
+        $found = $SearchFolders | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'pci.ids' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    }
+    if (-not $found) {
+        $target = $SearchFolders | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } |
+            Select-Object -First 1 | ForEach-Object { Join-Path $_ 'pci.ids' }
+        if (-not $target) { $target = Join-Path ([System.IO.Path]::GetTempPath()) 'pci.ids' }
+        foreach ($url in 'https://raw.githubusercontent.com/pciutils/pciids/master/pci.ids', 'https://pci-ids.ucw.cz/v2.2/pci.ids') {
+            try {
+                Write-Host "Downloading PCI ID database from $url ..."
+                $p = @{ UseBasicParsing = $true; Uri = $url; OutFile = $target; TimeoutSec = 120; ErrorAction = 'Stop' }
+                if ($WebParams) { foreach ($k in $WebParams.Keys) { $p[$k] = $WebParams[$k] } }
+                Invoke-WebRequest @p
+                if (Test-Path -LiteralPath $target -PathType Leaf) { $found = $target; break }
+            }
+            catch { Write-Verbose "Download failed from ${url}: $($_.Exception.Message)" }
+        }
+    }
+    if (-not $found) {
+        Write-Warning "PCI ID database (pci.ids) not available; exact names will come from the BCG only. Copy pci.ids next to the script or use -PciIdsFile."
+        return $null
+    }
+    try {
+        $db = Import-PciIds $found
+        $ageDays = ((Get-Date) - (Get-Item -LiteralPath $found).LastWriteTime).TotalDays
+        Write-Host ("Using PCI ID database {0} ({1:N0} card entries){2}" -f $found, $db.Subsys.Count,
+            $(if ($ageDays -gt 180) { ' - over 6 months old, delete it to download a fresh copy' } else { '' }))
+        return $db
+    }
+    catch {
+        Write-Warning "Could not read ${found}: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-ShortVendorName {
+    param([string]$Name)
+    if (-not $Name) { return '' }
+    return ($Name -replace '(,?\s+(Inc\.?|Corporation|Corp\.?|Co\.,?\s*Ltd\.?|Ltd\.?|LLC|and subsidiaries|Technologies))+$', '').Trim()
+}
+
+function Resolve-PciName {
+    param($Db, [string]$VID, [string]$DID, [string]$SVID, [string]$SSID)
+    $r = [pscustomobject]@{ Chip = ''; Card = '' }
+    if (-not $Db -or -not $VID -or -not $DID) { return $r }
+    $d = $Db.Devices["$VID`:$DID"]
+    if ($d) { $r.Chip = ("{0} {1}" -f (Get-ShortVendorName $Db.Vendors[$VID]), $d).Trim() }
+    if ($SVID -and $SSID) {
+        $s = $Db.Subsys["$VID`:$DID`:$SVID`:$SSID"]
+        if ($s) { $r.Card = ("{0} {1}" -f (Get-ShortVendorName $Db.Vendors[$SVID]), $s).Trim() }
+    }
+    return $r
+}
+
+function Get-HexValues {
+    # All 4-digit hex values in a BCG field (string, number, array or object)
+    param($Value)
+    if ($null -eq $Value) { return @() }
+    $s = $(if ($Value -is [string] -or $Value -is [ValueType]) { [string]$Value } else { $Value | ConvertTo-Json -Compress -Depth 5 })
+    return @([regex]::Matches($s, '(?i)(?<![0-9a-z])(?:0x)?([0-9a-f]{4})(?![0-9a-z])') |
+        ForEach-Object { [Convert]::ToInt32($_.Groups[1].Value, 16) })
+}
+
+function Select-BcgSsidMatch {
+    # Narrows BCG entries (all sharing VID/DID/SVID) to those whose SSID field matches the device's SSID.
+    # The BCG field name isn't documented, so any field containing "ssid" is checked (single value, list or min/max range).
+    param($Entries, [string]$SSID)
+    $all = @($Entries | Where-Object { $_ })
+    $out = [pscustomobject]@{ Entries = $all; Match = '' }
+    if ($all.Count -eq 0) { return $out }
+    if (-not $SSID) { $out.Match = 'SSID not in export'; return $out }
+
+    $target = [Convert]::ToInt32($SSID, 16)
+    $fieldSeen = $false
+    $matched = @()
+    foreach ($e in $all) {
+        $props = @($e.PSObject.Properties | Where-Object { $_.Name -match 'ssid' -and $_.Name -notmatch 'svid' })
+        if ($props.Count -eq 0) { continue }
+        $fieldSeen = $true
+        $hit = $false
+        $minP = $props | Where-Object { $_.Name -match 'min' } | Select-Object -First 1
+        $maxP = $props | Where-Object { $_.Name -match 'max' } | Select-Object -First 1
+        if ($minP -and $maxP) {
+            $lo = @(Get-HexValues $minP.Value) | Select-Object -First 1
+            $hi = @(Get-HexValues $maxP.Value) | Select-Object -First 1
+            if ($null -ne $lo -and $null -ne $hi -and $target -ge $lo -and $target -le $hi) { $hit = $true }
+        }
+        if (-not $hit) {
+            foreach ($p in $props) { if ((Get-HexValues $p.Value) -contains $target) { $hit = $true; break } }
+        }
+        if ($hit) { $matched += $e }
+    }
+    if (-not $fieldSeen)      { $out.Match = 'SSID not in BCG data' }
+    elseif ($matched.Count)  { $out.Entries = $matched; $out.Match = 'Exact (SSID)' }
+    else                     { $out.Match = "No BCG entry for SSID $SSID" }
+    return $out
+}
+
+function Get-BcgModelNames {
+    # "Brand Model" per entry, unique
+    param($Entries)
+    return @($Entries | ForEach-Object {
+        $b = [string]$_.brandName; $m = [string]$_.model.name
+        if ($m -and $b -and $m -notlike "$b*") { "$b $m" } elseif ($m) { $m } else { $b }
+    } | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Get-ReleaseUnion {
+    # Union of supported releases across entries, keeping BCG's order (newest first)
+    param($Entries)
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $rel  = New-Object System.Collections.Generic.List[string]
+    foreach ($e in @($Entries)) {
+        foreach ($r in @($e.supportedReleases)) {
+            $n = $(if ($r -is [string]) { $r } else { [string]$r.name })
+            if ($n -and $seen.Add($n)) { $rel.Add($n) }
+        }
+    }
+    return $rel.ToArray()
+}
+
+function Get-ExactModel {
+    # Best available card name and where it came from
+    param([string]$SsidMatch, [string[]]$MatchedModels, [int]$AllModelCount, $Pci, [string]$SSID, [string]$Fallback)
+    $mm = @($MatchedModels | Where-Object { $_ })
+    if ($SsidMatch -eq 'Exact (SSID)' -and $mm.Count -eq 1) { return @{ Model = $mm[0]; Source = 'BCG (SSID match)' } }
+    if ($Pci -and $Pci.Card)                                 { return @{ Model = $Pci.Card; Source = 'PCI ID database' } }
+    if ($SsidMatch -eq 'Exact (SSID)' -and $mm.Count -gt 1)  { return @{ Model = ($mm -join '; '); Source = 'BCG (SSID match, several entries)' } }
+    if ($AllModelCount -eq 1 -and $mm.Count -eq 1 -and $SsidMatch -notlike 'No BCG entry*') {
+        return @{ Model = $mm[0]; Source = 'BCG (only entry for VID/DID/SVID)' }
+    }
+    $chip = $(if ($Pci -and $Pci.Chip) { $Pci.Chip } else { $Fallback })
+    $why  = $(if (-not $SSID) { 'chip only - SSID not exported' } else { 'chip only - SSID not in PCI ID database' })
+    return @{ Model = $chip; Source = $why }
+}
+#endregion
 
 #region BCG lookup (based on Check-BroadcomCompatIoDevice)
 # Broadcom Compatibility Guide (BCG) REST endpoint (replaced the old vmware.com/resources/compatibility VCG)
@@ -393,6 +590,13 @@ function Join-Unique {
 }
 #endregion
 
+#region PCI ID database (exact card names)
+$pciDb = $null
+if (-not $NoPciIds) {
+    $pciDb = Get-PciIdsDatabase -File $PciIdsFile -SearchFolders @($PSScriptRoot, (Get-Location).Path)
+}
+#endregion
+
 #region Connect
 if (-not (Get-Module -ListAvailable -Name VMware.VimAutomation.Core)) {
     Write-Error "VMware PowerCLI is not installed. Run: Install-Module VCF.PowerCLI -Scope CurrentUser (PowerCLI 9.x) or Install-Module VMware.PowerCLI -Scope CurrentUser (13.x)"
@@ -485,6 +689,7 @@ try {
     $report = New-Object System.Collections.Generic.List[object]
     $detail = New-Object System.Collections.Generic.List[object]
     $hostReport = New-Object System.Collections.Generic.List[object]
+    $exactModelByKey = @{}
 
     foreach ($cluster in $selected) {
         $hostCount = @($cluster.Host).Count
@@ -580,6 +785,7 @@ try {
                 $vid  = "{0:x4}" -f $d.VendorId
                 $did  = "{0:x4}" -f $d.DeviceId
                 $svid = "{0:x4}" -f $d.SubVendorId
+                $ssid = "{0:x4}" -f $d.SubDeviceId
                 if ($svid -eq "0000") { continue }
                 if ($excludeDevices | Where-Object { $d.DeviceName -like "*$_*" }) { continue }
 
@@ -588,6 +794,7 @@ try {
                 if ($pciAddr -and $versionMap.ContainsKey($pciAddr)) { $ver = $versionMap[$pciAddr] }
 
                 [pscustomobject]@{
+                    Cluster         = $cluster.Name
                     Host            = $h.Name
                     PciAddress      = $pciAddr
                     Alias           = $(if ($ver) { $ver.Alias } else { '' })
@@ -596,6 +803,7 @@ try {
                     VID             = $vid
                     DID             = $did
                     SVID            = $svid
+                    SSID            = $ssid
                     Driver          = $(if ($ver) { $ver.Driver } else { '' })
                     DriverVersion   = $(if ($ver) { $ver.DriverVersion } else { '' })
                     FirmwareVersion = $(if ($ver) { $ver.FirmwareVersion } else { '' })
@@ -629,7 +837,7 @@ try {
         Write-Host "  IO devices:" -ForegroundColor Cyan
 
         # Collapse to unique devices per cluster
-        $unique = @($deviceRows | Group-Object VID, DID, SVID)
+        $unique = @($deviceRows | Group-Object VID, DID, SVID, SSID)
         Write-Host "  Found $($unique.Count) unique devices. Checking BCG..."
 
         $n = 0
@@ -642,14 +850,19 @@ try {
             $bcg = Get-BcgIoDevice -VID $first.VID -DID $first.DID -SVID $first.SVID
             $hostsWith = @($g.Group.Host | Sort-Object -Unique)
 
+            # Narrow the BCG entries (all sharing VID/DID/SVID) to this card's SSID, and work out the exact model
+            $sel = Select-BcgSsidMatch -Entries $bcg.Entries -SSID $first.SSID
             $brands = @(); $models = @(); $types = @(); $releases = ""
-            if ($bcg.Entries.Count -gt 0) {
-                $brands   = $bcg.Entries | ForEach-Object { $_.brandName }  | Sort-Object -Unique
-                $models   = $bcg.Entries | ForEach-Object { $_.model.name } | Sort-Object -Unique
-                $types    = $bcg.Entries | ForEach-Object { $_.deviceType } | Sort-Object -Unique
-                $releases = ($bcg.Entries[0].supportedReleases.name |
-                    Select-Object -First $ShowNumberOfSupportedReleases) -join ", "
+            if (@($sel.Entries).Count -gt 0) {
+                $brands   = $sel.Entries | ForEach-Object { $_.brandName }  | Sort-Object -Unique
+                $models   = Get-BcgModelNames $sel.Entries
+                $types    = $sel.Entries | ForEach-Object { $_.deviceType } | Sort-Object -Unique
+                $releases = (Get-ReleaseUnion $sel.Entries | Select-Object -First $ShowNumberOfSupportedReleases) -join ", "
             }
+            $pciName = Resolve-PciName -Db $pciDb -VID $first.VID -DID $first.DID -SVID $first.SVID -SSID $first.SSID
+            $exact = Get-ExactModel -SsidMatch $sel.Match -MatchedModels $models -AllModelCount @(Get-BcgModelNames $bcg.Entries).Count `
+                -Pci $pciName -SSID $first.SSID -Fallback $first.Device
+            $exactModelByKey["$($first.VID):$($first.DID):$($first.SVID):$($first.SSID)"] = $exact.Model
 
             # Driver/firmware across hosts; more than one value = drift within the cluster
             $drivers   = Join-Unique $g.Group.Driver
@@ -664,9 +877,12 @@ try {
                 ClusterHosts      = $hostCount
                 Vendor            = $first.Vendor
                 Device            = $first.Device
+                ExactModel        = $exact.Model
+                ModelSource       = $exact.Source
                 VID               = $first.VID
                 DID               = $first.DID
                 SVID              = $first.SVID
+                SSID              = $first.SSID
                 HostsWithDevice   = "{0}/{1}" -f $hostsWith.Count, $connectedCount
                 Instances         = $g.Count
                 Driver            = $drivers
@@ -674,6 +890,7 @@ try {
                 FirmwareVersion   = $fwVer
                 VersionDrift      = $(if ($drift) { $drift -join "+" } else { "" })
                 BCGStatus         = $bcg.Status
+                BCGSsidMatch      = $sel.Match
                 BCGBrand          = $brands -join "; "
                 BCGModel          = $models -join "; "
                 BCGDeviceType     = $types  -join "; "
@@ -685,10 +902,11 @@ try {
 
         $clusterRows = @($clusterRows | Sort-Object BCGStatus, Vendor, Device)
         if ($SkipVersions) {
-            $clusterRows | Format-Table Vendor, Device, VID, DID, SVID, HostsWithDevice, BCGStatus, SupportedReleases -AutoSize -Wrap | Out-Host
+            $clusterRows | Format-Table @{ N = 'Model'; E = { $_.ExactModel } }, @{ N = 'VID:DID:SVID:SSID'; E = { "$($_.VID):$($_.DID):$($_.SVID):$($_.SSID)" } },
+                HostsWithDevice, BCGStatus, SupportedReleases -AutoSize -Wrap | Out-Host
         }
         else {
-            $clusterRows | Format-Table Device, @{ N = 'VID:DID:SVID'; E = { "$($_.VID):$($_.DID):$($_.SVID)" } },
+            $clusterRows | Format-Table @{ N = 'Model'; E = { $_.ExactModel } }, @{ N = 'VID:DID:SVID:SSID'; E = { "$($_.VID):$($_.DID):$($_.SVID):$($_.SSID)" } },
                 @{ N = 'Hosts'; E = { $_.HostsWithDevice } }, Driver,
                 @{ N = 'DriverVer'; E = { $_.DriverVersion } }, @{ N = 'Firmware'; E = { $_.FirmwareVersion } },
                 @{ N = 'BCG'; E = { $_.BCGStatus } } -AutoSize -Wrap | Out-Host
@@ -697,6 +915,11 @@ try {
             if ($drifted.Count) {
                 Write-Host "  Warning: $($drifted.Count) device(s) have different driver/firmware versions across hosts (see _PerHost.csv)." -ForegroundColor Yellow
             }
+        }
+
+        $noSsid = @($clusterRows | Where-Object { $_.BCGSsidMatch -like 'No BCG entry for SSID*' })
+        if ($noSsid.Count) {
+            Write-Host "  Note: $($noSsid.Count) device(s) have BCG entries for their chip/vendor but none for their SSID (exact card) - verify on the BCG." -ForegroundColor Yellow
         }
 
         # Flag devices not present on every host (possible hardware inconsistency)
@@ -709,31 +932,75 @@ try {
     }
     #endregion
 
-    #region Export
-    if ($report.Count -gt 0) {
-        if (-not $OutputCsv) {
-            $safeName  = $vCenter -replace '[^\w\.-]', '_'
-            $OutputCsv = Join-Path (Get-Location) ("IoCompatibility_{0}_{1}.csv" -f $safeName, (Get-Date -Format "yyyyMMdd_HHmmss"))
+    #region Export (one folder per cluster)
+    if ($report.Count -gt 0 -or $hostReport.Count -gt 0) {
+        if (-not $OutputFolder) {
+            if ($OutputCsv) {
+                $full = [System.IO.Path]::GetFullPath($OutputCsv)
+                $OutputFolder = Join-Path ([System.IO.Path]::GetDirectoryName($full)) ([System.IO.Path]::GetFileNameWithoutExtension($full))
+            }
+            else {
+                $safeVc = $vCenter -replace '[^\w\.-]', '_'
+                $OutputFolder = Join-Path (Get-Location) ("IoCompatibility_{0}_{1}" -f $safeVc, (Get-Date -Format "yyyyMMdd_HHmmss"))
+            }
         }
-        $report | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
-        Write-Host "`nReport saved to: $OutputCsv" -ForegroundColor Cyan
+        New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+        Write-Host "`nWriting results to $OutputFolder" -ForegroundColor Cyan
 
-        if ($detail.Count -gt 0) {
-            $detailCsv = [System.IO.Path]::ChangeExtension($OutputCsv, $null).TrimEnd('.') + "_PerHost.csv"
-            $detail | Sort-Object Host, PciAddress |
-                Select-Object Host, PciAddress, Alias, Vendor, Device, VID, DID, SVID, Driver, DriverVersion, FirmwareVersion |
-                Export-Csv -Path $detailCsv -NoTypeInformation -Encoding UTF8
-            Write-Host "Per-host detail saved to: $detailCsv" -ForegroundColor Cyan
+        $clusterIndex = New-Object System.Collections.Generic.List[object]
+        $usedFolders  = @{}
+        foreach ($cl in $selected) {
+            $name  = [string]$cl.Name
+            $sum   = @($report     | Where-Object { $_.Cluster -eq $name })
+            $per   = @($detail     | Where-Object { $_.Cluster -eq $name })
+            $hosts = @($hostReport | Where-Object { $_.Cluster -eq $name })
+            if (($sum.Count + $per.Count + $hosts.Count) -eq 0) { continue }
+
+            # Folder-safe cluster name; de-duplicate if two names clean up to the same thing
+            $safe = ($name -replace '[\\/:*?"<>|]', '_').Trim().TrimEnd('.')
+            if (-not $safe) { $safe = 'Cluster' }
+            $key = $safe.ToLower()
+            if ($usedFolders.ContainsKey($key)) { $usedFolders[$key]++; $safe = "{0}_{1}" -f $safe, $usedFolders[$key] }
+            else { $usedFolders[$key] = 1 }
+
+            $dir  = Join-Path $OutputFolder $safe
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $base = Join-Path $dir "$($safe)_IO"
+
+            if ($sum.Count) {
+                $sum | Export-Csv -LiteralPath "$base.csv" -NoTypeInformation -Encoding UTF8
+            }
+            if ($per.Count) {
+                $per | Sort-Object Host, PciAddress |
+                    Select-Object Cluster, Host, PciAddress, Alias, Vendor, Device,
+                        @{ N = 'ExactModel'; E = { $exactModelByKey["$($_.VID):$($_.DID):$($_.SVID):$($_.SSID)"] } },
+                        VID, DID, SVID, SSID, Driver, DriverVersion, FirmwareVersion |
+                    Export-Csv -LiteralPath "$($base)_PerHost.csv" -NoTypeInformation -Encoding UTF8
+            }
+            if ($hosts.Count) {
+                $hosts | Export-Csv -LiteralPath "$($base)_Hosts.csv" -NoTypeInformation -Encoding UTF8
+            }
+
+            $clusterIndex.Add([pscustomobject][ordered]@{
+                Cluster          = $name
+                Folder           = $safe
+                ClusterHosts     = @($cl.Host).Count
+                HostsReported    = $hosts.Count
+                IoDevices        = $sum.Count
+                NotListed        = @($sum | Where-Object { $_.BCGStatus -ne 'Listed' }).Count
+                NoSsidMatch      = @($sum | Where-Object { $_.BCGSsidMatch -like 'No BCG entry*' }).Count
+                VersionDrift     = @($sum | Where-Object { $_.VersionDrift }).Count
+                LegacyBiosHosts  = @($hosts | Where-Object { $_.BootMode -eq 'BIOS' -or $_.BootMode -like 'LEGACY*' }).Count
+                UsbSdBootHosts   = @($hosts | Where-Object { $_.BootType -eq 'USB/SD card' }).Count
+                BootFsOver80Pct  = @($hosts | Where-Object { $_.BootFsMaxUsedPct -ne '' -and [int]$_.BootFsMaxUsedPct -ge 80 }).Count
+            })
+            Write-Host ("  {0,-30} -> {1}" -f $name, $dir)
         }
-    }
-    if ($hostReport.Count -gt 0) {
-        if (-not $OutputCsv) {
-            $safeName  = $vCenter -replace '[^\w\.-]', '_'
-            $OutputCsv = Join-Path (Get-Location) ("IoCompatibility_{0}_{1}.csv" -f $safeName, (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+        if ($clusterIndex.Count) {
+            $clusterIndex | Export-Csv -LiteralPath (Join-Path $OutputFolder 'Clusters_Summary.csv') -NoTypeInformation -Encoding UTF8
+            Write-Host "Cluster overview: $(Join-Path $OutputFolder 'Clusters_Summary.csv')" -ForegroundColor Cyan
         }
-        $hostsCsv = [System.IO.Path]::ChangeExtension($OutputCsv, $null).TrimEnd('.') + "_Hosts.csv"
-        $hostReport | Export-Csv -Path $hostsCsv -NoTypeInformation -Encoding UTF8
-        Write-Host "Host / boot details saved to: $hostsCsv" -ForegroundColor Cyan
     }
 
     $notListed = @($report | Where-Object { $_.BCGStatus -ne "Listed" })
