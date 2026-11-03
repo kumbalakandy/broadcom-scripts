@@ -1,38 +1,3 @@
-<#
-.SYNOPSIS
-    Checks the I/O devices of vSphere cluster hosts against the Broadcom Compatibility Guide (BCG)
-    and reports boot-disk, driver and firmware details.
-.DESCRIPTION
-    Requires VMware PowerCLI 12.x/13.x or VCF PowerCLI 9.x (module VMware.VimAutomation.Core) and
-    outbound HTTPS to compatibilityguide.broadcom.com.
-    If the script "will not load" on Windows, it is usually the execution policy or the downloaded-file block:
-        Unblock-File .\Get-ClusterIoCompatibility.ps1
-        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.PARAMETER OutputFolder
-    Folder for the results. Default: .\IoCompatibility_<vCenter>_<timestamp>
-    Inside it, one subfolder per cluster holds that cluster's files:
-        <Cluster>\<Cluster>_IO.csv          unique IO devices with BCG status
-        <Cluster>\<Cluster>_IO_PerHost.csv  every IO device on every host
-        <Cluster>\<Cluster>_IO_Hosts.csv    server, boot mode and boot disk details
-    plus Clusters_Summary.csv at the top level with counts per cluster.
-.PARAMETER OutputCsv
-    Kept for compatibility: if given (and -OutputFolder isn't), its folder and file name
-    (without extension) become the output folder, e.g. C:\Temp\io.csv -> C:\Temp\io\
-.PARAMETER PciIdsFile
-    Path to a pci.ids file (PCI ID database) used to name the exact card from VID/DID/SVID/SSID.
-    If omitted, pci.ids next to the script or in the current folder is used, otherwise it is
-    downloaded once (needs internet). For offline use get it from https://pci-ids.ucw.cz/v2.2/pci.ids
-.PARAMETER NoPciIds
-    Don't use the PCI ID database; exact names then come from the BCG SSID match only.
-.NOTES
-    Exact model: VID+DID identify the chip, SVID the card maker and SSID (subsystem device ID) the
-    exact card. ExactModel comes from, in order: the BCG entry matching the SSID, the PCI ID database
-    entry for VID:DID:SVID:SSID, the only BCG entry for VID/DID/SVID, or the chip name (ModelSource says which).
-.EXAMPLE
-    .\Get-ClusterIoCompatibility.ps1 -vCenter vc01.lab.local -All
-.EXAMPLE
-    .\Get-ClusterIoCompatibility.ps1 -vCenter vc01.lab.local -ClusterName Prod01,Prod02 -OutputCsv C:\Temp\io.csv
-#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$vCenter,
